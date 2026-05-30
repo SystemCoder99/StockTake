@@ -610,7 +610,7 @@ async function loadItems() {
 // ═══════════════════════════════════════════════
 
 // !! REPLACE THIS with your own Client ID from Google Cloud Console !!
-const GOOGLE_CLIENT_ID = '756553788670-lqo1h7gqf91csgr1j5c5ji77fonmnts5.apps.googleusercontent.com';
+const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID_HERE';
 
 const DRIVE_SCOPE    = 'https://www.googleapis.com/auth/drive.appdata';
 const DRIVE_FILENAME = 'pantry-tracker-backup.json';
@@ -630,33 +630,42 @@ function setDriveStatus(state, text) {
   label.textContent = text;
 }
 
-// ── Get a valid token (silently if possible, prompt if not) ──
-function getDriveToken(interactive = false) {
+// ── Wait for Google Identity Services to load ──
+function waitForGoogle(timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
+    if (window.google?.accounts?.oauth2) return resolve();
+    const start = Date.now();
+    const check = setInterval(() => {
+      if (window.google?.accounts?.oauth2) { clearInterval(check); resolve(); }
+      else if (Date.now() - start > timeoutMs) { clearInterval(check); reject(new Error('Google script timed out — check your internet connection')); }
+    }, 100);
+  });
+}
+
+// ── Get a valid token (interactive = show Google sign-in popup) ──
+function getDriveToken(interactive = false) {
+  return new Promise(async (resolve, reject) => {
     // If we have a token that's still valid (with 60s buffer), reuse it
     if (driveToken && Date.now() < driveTokenExp - 60000) {
       return resolve(driveToken);
     }
-    if (!window.google?.accounts?.oauth2) {
-      return reject(new Error('Google Identity Services not loaded'));
+    try {
+      await waitForGoogle();
+    } catch(e) {
+      return reject(e);
     }
     const client = google.accounts.oauth2.initTokenClient({
       client_id: GOOGLE_CLIENT_ID,
       scope: DRIVE_SCOPE,
       callback: (resp) => {
-        if (resp.error) return reject(new Error(resp.error));
+        if (resp.error) return reject(new Error(resp.error === 'access_denied' ? 'Permission denied — please allow access to continue' : resp.error));
         driveToken    = resp.access_token;
         driveTokenExp = Date.now() + (resp.expires_in * 1000);
         resolve(driveToken);
       },
-      error_callback: (e) => reject(new Error(e.message || 'Auth failed')),
+      error_callback: (e) => reject(new Error(e.type === 'popup_closed' ? 'Sign-in popup was closed' : (e.message || 'Sign-in failed'))),
     });
-    // prompt=none tries silently; prompt='' shows the picker
-    if (interactive) {
-      client.requestAccessToken({ prompt: '' });
-    } else {
-      client.requestAccessToken({ prompt: 'none' });
-    }
+    client.requestAccessToken({ prompt: interactive ? '' : 'none' });
   });
 }
 
@@ -768,22 +777,11 @@ function openDriveModal() {
   const body = document.getElementById('drive-modal-body');
   const isConfigured = GOOGLE_CLIENT_ID !== 'YOUR_GOOGLE_CLIENT_ID_HERE';
 
-  if (!isConfigured) {
-    body.innerHTML = `
-      <div class="drive-info">
-        <strong>Setup required</strong><br><br>
-        To enable Drive sync, you need to add your Google Client ID to <code>app.js</code>.
-        See the setup guide for instructions.
-      </div>
-      <button class="btn btn-secondary" onclick="closeModal('drive-modal')">Close</button>`;
-    openModal('drive-modal');
-    return;
-  }
-
-  body.innerHTML = `
+  body.innerHTML = isConfigured ? `
     <div class="drive-info">
-      Your pantry data is saved as a private file in your Google Drive that only this app can see.
-      It won't appear in your normal Drive view.
+      Your pantry data is saved as a private file in your Google Drive that <strong>only this app can see</strong> — it won't appear in your normal Drive view.
+      <br><br>
+      You'll be asked to sign in to Google the first time.
     </div>
 
     <div class="sync-row">
@@ -802,24 +800,42 @@ function openDriveModal() {
       <button class="btn-icon" id="btn-do-restore" title="Restore now">⬇️</button>
     </div>
 
-    <div id="drive-result" style="margin-top:12px;font-size:0.85rem;color:var(--muted);min-height:20px"></div>
-    <button class="btn btn-secondary" onclick="closeModal('drive-modal')" style="margin-top:16px">Close</button>`;
+    <div id="drive-result" style="margin-top:14px;font-size:0.85rem;line-height:1.5;min-height:20px"></div>
+    <button class="btn btn-secondary" onclick="closeModal('drive-modal')" style="margin-top:16px">Close</button>
+  ` : `
+    <div class="drive-info">
+      <strong>⚙️ Client ID not set yet</strong><br><br>
+      Open <code>app.js</code> and replace <code>YOUR_GOOGLE_CLIENT_ID_HERE</code> with the Client ID from your Google Cloud Console project.<br><br>
+      Once that's done, push to GitHub and this button will work.
+    </div>
+    <button class="btn btn-secondary" onclick="closeModal('drive-modal')">Got it</button>`;
 
-  document.getElementById('btn-do-backup').onclick = async () => {
-    document.getElementById('drive-result').textContent = '⏳ Signing in and saving…';
-    const r = await backupToDrive();
-    document.getElementById('drive-result').textContent = r.ok
-      ? '✅ Backup saved successfully to your Google Drive.'
-      : `❌ ${r.error}`;
-  };
+  if (isConfigured) {
+    // Wire up after innerHTML is set
+    setTimeout(() => {
+      const resultEl = () => document.getElementById('drive-result');
 
-  document.getElementById('btn-do-restore').onclick = async () => {
-    document.getElementById('drive-result').textContent = '⏳ Signing in and restoring…';
-    const r = await restoreFromDrive();
-    document.getElementById('drive-result').textContent = r.ok
-      ? `✅ Restored ${r.total} items (${r.added} new, ${r.updated} updated).`
-      : `❌ ${r.error}`;
-  };
+      document.getElementById('btn-do-backup').onclick = async () => {
+        resultEl().style.color = 'var(--muted)';
+        resultEl().textContent = '⏳ Signing in and saving…';
+        const r = await backupToDrive();
+        resultEl().style.color = r.ok ? 'var(--ok)' : 'var(--danger)';
+        resultEl().textContent = r.ok
+          ? '✅ Backup saved to your Google Drive.'
+          : `❌ ${r.error}`;
+      };
+
+      document.getElementById('btn-do-restore').onclick = async () => {
+        resultEl().style.color = 'var(--muted)';
+        resultEl().textContent = '⏳ Signing in and restoring…';
+        const r = await restoreFromDrive();
+        resultEl().style.color = r.ok ? 'var(--ok)' : 'var(--danger)';
+        resultEl().textContent = r.ok
+          ? `✅ Restored ${r.total} items (${r.added} new, ${r.updated} updated).`
+          : `❌ ${r.error}`;
+      };
+    }, 0);
+  }
 
   openModal('drive-modal');
 }
