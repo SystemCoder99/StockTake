@@ -3,6 +3,6 @@
 // The Client ID and server URL are not secrets.
 
 const CONFIG = {
-  googleClientId: 'YOUR_GOOGLE_CLIENT_ID_HERE',
-  serverUrl:      'YOUR_SERVER_URL_HERE', // e.g. https://pantry.yourdomain.com
+  googleClientId: '756553788670-lqo1h7gqf91csgr1j5c5ji77fonmnts5.apps.googleusercontent.com',
+  serverUrl:      'https://pantry.faenlaud.uk',
 };
