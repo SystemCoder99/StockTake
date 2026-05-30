@@ -1,7 +1,7 @@
 // sw.js — Pantry Tracker Service Worker
 // Cache-first for app shell, network-first for API calls
 
-const CACHE = 'pantry-v2';
+const CACHE = 'pantry-v3';
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -28,6 +28,12 @@ self.addEventListener('activate', e => {
 
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
+
+  // Always network-first for Google auth (never cache auth scripts)
+  if (url.hostname.includes('accounts.google.com') || url.hostname.includes('googleapis.com')) {
+    e.respondWith(fetch(e.request).catch(() => new Response('', { status: 503 })));
+    return;
+  }
 
   // Always network-first for product lookups (Open Food Facts API)
   if (url.hostname.includes('openfoodfacts')) {

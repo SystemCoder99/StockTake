@@ -78,13 +78,20 @@ function expiryClass(dateStr) {
   if (d <= 3) return 'warn';
   return 'ok';
 }
+// Format a YYYY-MM-DD string as DD/MM/YYYY for display
+function fmtDate(dateStr) {
+  if (!dateStr) return '';
+  const [y, m, dd] = dateStr.split('-');
+  return `${dd}/${m}/${y}`;
+}
+
 function expiryLabel(dateStr) {
   const d = daysUntil(dateStr);
   if (d < 0)  return `Expired ${Math.abs(d)}d ago`;
   if (d === 0) return 'Expires today!';
   if (d === 1) return 'Expires tomorrow';
   if (d <= 3) return `Expires in ${d} days`;
-  return `Best before ${dateStr}`;
+  return `Best before ${fmtDate(dateStr)}`;
 }
 
 // ═══════════════════════════════════════════════
@@ -198,7 +205,7 @@ function openDetail(id) {
   const d  = document.getElementById('detail-body');
   d.innerHTML = `
     <h2 style="font-family:var(--font-head);font-size:1.4rem;margin-bottom:4px">${esc(item.name)}</h2>
-    <p style="font-size:0.8rem;color:var(--muted);margin-bottom:20px">Added ${item.added}</p>
+    <p style="font-size:0.8rem;color:var(--muted);margin-bottom:20px">Added ${fmtDate(item.added)}</p>
     ${ec==='expired' ? `<div class="expired-banner">⚠️ This item has expired and should be discarded.</div>` : ''}
     <div class="result-pill">
       <span class="pill-icon">📅</span>
@@ -594,6 +601,230 @@ async function loadItems() {
 }
 
 // ═══════════════════════════════════════════════
+//  Google Drive Sync
+//  ─ Uses Google Identity Services (OAuth 2.0)
+//  ─ Saves pantry data as a single JSON file
+//    called "pantry-tracker-backup.json" in the
+//    user's Drive app data folder (hidden from
+//    their main Drive view, only this app sees it)
+// ═══════════════════════════════════════════════
+
+// !! REPLACE THIS with your own Client ID from Google Cloud Console !!
+const GOOGLE_CLIENT_ID = '756553788670-lqo1h7gqf91csgr1j5c5ji77fonmnts5.apps.googleusercontent.com';
+
+const DRIVE_SCOPE    = 'https://www.googleapis.com/auth/drive.appdata';
+const DRIVE_FILENAME = 'pantry-tracker-backup.json';
+
+let driveToken     = null;  // current OAuth access token
+let driveTokenExp  = 0;     // when it expires (epoch ms)
+let driveFileId    = null;  // cached file ID once we've found/created the file
+
+// ── Status indicator ──
+function setDriveStatus(state, text) {
+  const dot    = document.getElementById('drive-dot');
+  const label  = document.getElementById('drive-status-text');
+  const status = document.getElementById('drive-status');
+  if (!dot) return;
+  status.style.display = 'flex';
+  dot.className = `drive-dot ${state}`;
+  label.textContent = text;
+}
+
+// ── Get a valid token (silently if possible, prompt if not) ──
+function getDriveToken(interactive = false) {
+  return new Promise((resolve, reject) => {
+    // If we have a token that's still valid (with 60s buffer), reuse it
+    if (driveToken && Date.now() < driveTokenExp - 60000) {
+      return resolve(driveToken);
+    }
+    if (!window.google?.accounts?.oauth2) {
+      return reject(new Error('Google Identity Services not loaded'));
+    }
+    const client = google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: DRIVE_SCOPE,
+      callback: (resp) => {
+        if (resp.error) return reject(new Error(resp.error));
+        driveToken    = resp.access_token;
+        driveTokenExp = Date.now() + (resp.expires_in * 1000);
+        resolve(driveToken);
+      },
+      error_callback: (e) => reject(new Error(e.message || 'Auth failed')),
+    });
+    // prompt=none tries silently; prompt='' shows the picker
+    if (interactive) {
+      client.requestAccessToken({ prompt: '' });
+    } else {
+      client.requestAccessToken({ prompt: 'none' });
+    }
+  });
+}
+
+// ── Find the backup file in appDataFolder ──
+async function findDriveFile(token) {
+  const r = await fetch(
+    `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D%27${DRIVE_FILENAME}%27&fields=files(id,name,modifiedTime)`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const j = await r.json();
+  return j.files?.[0] || null;
+}
+
+// ── Upload (create or update) the backup file ──
+async function uploadToDrive(token, data) {
+  const body     = JSON.stringify(data);
+  const blob     = new Blob([body], { type: 'application/json' });
+  const metadata = { name: DRIVE_FILENAME, parents: driveFileId ? undefined : ['appDataFolder'] };
+
+  let url, method;
+  if (driveFileId) {
+    // Update existing file
+    url    = `https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=multipart`;
+    method = 'PATCH';
+  } else {
+    // Create new file
+    url    = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+    method = 'POST';
+  }
+
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+  form.append('file', blob);
+
+  const r = await fetch(url, {
+    method,
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  const j = await r.json();
+  if (j.id) driveFileId = j.id;
+  return j;
+}
+
+// ── Download the backup file ──
+async function downloadFromDrive(token, fileId) {
+  const r = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  return await r.json();
+}
+
+// ── Public: back up to Drive ──
+async function backupToDrive() {
+  setDriveStatus('syncing', 'Saving…');
+  try {
+    const token   = await getDriveToken(true);
+    const allItems = await dbAll();
+    await uploadToDrive(token, { version: 1, exportedAt: new Date().toISOString(), items: allItems });
+    setDriveStatus('connected', 'Saved ✓');
+    return { ok: true };
+  } catch(e) {
+    console.error('Drive backup failed', e);
+    setDriveStatus('error', 'Error');
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── Public: restore from Drive ──
+async function restoreFromDrive() {
+  setDriveStatus('syncing', 'Restoring…');
+  try {
+    const token = await getDriveToken(true);
+    // Find the file
+    if (!driveFileId) {
+      const file = await findDriveFile(token);
+      if (!file) {
+        setDriveStatus('error', 'No backup');
+        return { ok: false, error: 'No backup found in Drive' };
+      }
+      driveFileId = file.id;
+    }
+    const data = await downloadFromDrive(token, driveFileId);
+    if (!data?.items) {
+      return { ok: false, error: 'Backup file seems empty or corrupted' };
+    }
+    // Merge: keep local items not in backup, add/update from backup
+    const existing = await dbAll();
+    const existingIds = new Set(existing.map(i => i.id));
+    let added = 0, updated = 0;
+    for (const item of data.items) {
+      if (existingIds.has(item.id)) { await dbPut(item); updated++; }
+      else                          { await dbPut(item); added++; }
+    }
+    await loadItems();
+    render();
+    setDriveStatus('connected', 'Restored ✓');
+    return { ok: true, added, updated, total: data.items.length };
+  } catch(e) {
+    console.error('Drive restore failed', e);
+    setDriveStatus('error', 'Error');
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── Drive modal UI ──
+function openDriveModal() {
+  const body = document.getElementById('drive-modal-body');
+  const isConfigured = GOOGLE_CLIENT_ID !== 'YOUR_GOOGLE_CLIENT_ID_HERE';
+
+  if (!isConfigured) {
+    body.innerHTML = `
+      <div class="drive-info">
+        <strong>Setup required</strong><br><br>
+        To enable Drive sync, you need to add your Google Client ID to <code>app.js</code>.
+        See the setup guide for instructions.
+      </div>
+      <button class="btn btn-secondary" onclick="closeModal('drive-modal')">Close</button>`;
+    openModal('drive-modal');
+    return;
+  }
+
+  body.innerHTML = `
+    <div class="drive-info">
+      Your pantry data is saved as a private file in your Google Drive that only this app can see.
+      It won't appear in your normal Drive view.
+    </div>
+
+    <div class="sync-row">
+      <div>
+        <div class="sync-row-title">💾 Back up to Drive</div>
+        <div class="sync-row-label">Save current pantry to your Drive</div>
+      </div>
+      <button class="btn-icon" id="btn-do-backup" title="Back up now">⬆️</button>
+    </div>
+
+    <div class="sync-row">
+      <div>
+        <div class="sync-row-title">📥 Restore from Drive</div>
+        <div class="sync-row-label">Merge Drive backup into this device</div>
+      </div>
+      <button class="btn-icon" id="btn-do-restore" title="Restore now">⬇️</button>
+    </div>
+
+    <div id="drive-result" style="margin-top:12px;font-size:0.85rem;color:var(--muted);min-height:20px"></div>
+    <button class="btn btn-secondary" onclick="closeModal('drive-modal')" style="margin-top:16px">Close</button>`;
+
+  document.getElementById('btn-do-backup').onclick = async () => {
+    document.getElementById('drive-result').textContent = '⏳ Signing in and saving…';
+    const r = await backupToDrive();
+    document.getElementById('drive-result').textContent = r.ok
+      ? '✅ Backup saved successfully to your Google Drive.'
+      : `❌ ${r.error}`;
+  };
+
+  document.getElementById('btn-do-restore').onclick = async () => {
+    document.getElementById('drive-result').textContent = '⏳ Signing in and restoring…';
+    const r = await restoreFromDrive();
+    document.getElementById('drive-result').textContent = r.ok
+      ? `✅ Restored ${r.total} items (${r.added} new, ${r.updated} updated).`
+      : `❌ ${r.error}`;
+  };
+
+  openModal('drive-modal');
+}
+
+// ═══════════════════════════════════════════════
 //  PWA install
 // ═══════════════════════════════════════════════
 let deferredInstall = null;
@@ -630,8 +861,10 @@ document.getElementById('fab-scan').onclick = () => {
   showStep1();
 };
 
+document.getElementById('btn-drive').onclick = openDriveModal;
+
 // Close modals on backdrop click
-['scan-modal','detail-modal'].forEach(id => {
+['scan-modal','detail-modal','drive-modal'].forEach(id => {
   document.getElementById(id).addEventListener('click', e => {
     if (e.target.id === id) closeModal(id);
   });

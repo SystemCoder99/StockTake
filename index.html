@@ -12,6 +12,7 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <style>
     :root {
       --bg:        #1a1208;
@@ -45,7 +46,20 @@
     }
     header h1 { font-family: var(--font-head); font-size: 1.6rem; letter-spacing: -0.02em; }
     header h1 span { color: var(--accent); font-style: italic; }
-    .header-actions { display: flex; gap: 8px; }
+    .header-actions { display: flex; gap: 8px; align-items: center; }
+
+    /* ── Drive status dot ── */
+    .drive-status {
+      font-size: 0.7rem; color: var(--muted); display: flex; align-items: center; gap: 4px;
+    }
+    .drive-dot {
+      width: 7px; height: 7px; border-radius: 50%; background: var(--border);
+      transition: background 0.3s;
+    }
+    .drive-dot.connected { background: var(--ok); }
+    .drive-dot.syncing   { background: var(--warn); animation: pulse 1s ease-in-out infinite; }
+    .drive-dot.error     { background: var(--danger); }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
     /* ── Nav tabs ── */
     nav {
@@ -251,6 +265,21 @@
       padding: 12px 14px; margin-bottom: 16px; font-size: 0.85rem; color: #e07070;
       display: flex; align-items: center; gap: 8px;
     }
+
+    /* ── Drive modal specific ── */
+    .drive-info {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px; margin-bottom: 16px;
+      font-size: 0.85rem; line-height: 1.6; color: var(--muted);
+    }
+    .drive-info strong { color: var(--text); }
+    .sync-row {
+      display: flex; align-items: center; justify-content: space-between;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px; margin-bottom: 10px;
+    }
+    .sync-row-label { font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
+    .sync-row-title { font-weight: 500; }
   </style>
 </head>
 <body>
@@ -258,6 +287,11 @@
   <header>
     <h1>Pan<span>try</span></h1>
     <div class="header-actions">
+      <div class="drive-status" id="drive-status" style="display:none">
+        <div class="drive-dot" id="drive-dot"></div>
+        <span id="drive-status-text">Drive</span>
+      </div>
+      <button class="btn-icon" id="btn-drive" title="Google Drive sync">☁️</button>
       <button class="btn-icon" id="btn-install" style="display:none" title="Install app">⬇️</button>
     </div>
   </header>
@@ -305,6 +339,16 @@
   <div class="modal">
     <div class="modal-handle"></div>
     <div id="detail-body"></div>
+  </div>
+</div>
+
+<!-- ── Drive Sync Modal ── -->
+<div class="modal-backdrop" id="drive-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2>Google Drive Sync</h2>
+    <p class="subtitle">Back up and restore your pantry across devices</p>
+    <div id="drive-modal-body"></div>
   </div>
 </div>
 
