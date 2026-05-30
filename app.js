@@ -864,8 +864,8 @@ async function loadItems() {
 //    their main Drive view, only this app sees it)
 // ═══════════════════════════════════════════════
 
-// !! REPLACE THIS with your own Client ID from Google Cloud Console !!
-const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID_HERE';
+// Client ID is loaded from config.js
+const GOOGLE_CLIENT_ID = (typeof CONFIG !== 'undefined' && CONFIG.googleClientId) || 'YOUR_GOOGLE_CLIENT_ID_HERE';
 
 const DRIVE_SCOPE    = 'https://www.googleapis.com/auth/drive.appdata';
 const DRIVE_FILENAME = 'pantry-tracker-backup.json';

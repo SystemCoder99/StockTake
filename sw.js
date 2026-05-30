@@ -1,11 +1,12 @@
 // sw.js — Pantry Tracker Service Worker
 // Cache-first for app shell, network-first for API calls
 
-const CACHE = 'pantry-v4';
+const CACHE = 'pantry-v5';
 const APP_SHELL = [
   '/',
   '/index.html',
   '/app.js',
+  '/config.js',
   '/manifest.json',
   'https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap',
   'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js',
