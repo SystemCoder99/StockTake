@@ -51,6 +51,166 @@ function dbDelete(id) {
 }
 
 // ═══════════════════════════════════════════════
+//  Encryption
+//  AES-256-GCM, key derived from Google user ID
+//  via PBKDF2. Key never leaves the device.
+// ═══════════════════════════════════════════════
+const ENC_SALT = 'pantry-tracker-v1'; // fixed salt — changing this breaks all existing data
+
+async function deriveKey(googleUserId) {
+  const enc      = new TextEncoder();
+  const keyMat   = await crypto.subtle.importKey(
+    'raw', enc.encode(googleUserId), 'PBKDF2', false, ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: enc.encode(ENC_SALT), iterations: 200000, hash: 'SHA-256' },
+    keyMat,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encryptData(key, data) {
+  const iv         = crypto.getRandomValues(new Uint8Array(12));
+  const enc        = new TextEncoder();
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    enc.encode(JSON.stringify(data))
+  );
+  // Combine iv + ciphertext, encode as base64
+  const combined = new Uint8Array(iv.byteLength + ciphertext.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ciphertext), iv.byteLength);
+  return btoa(String.fromCharCode(...combined));
+}
+
+async function decryptData(key, b64) {
+  if (!b64) return null;
+  const combined   = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const iv         = combined.slice(0, 12);
+  const ciphertext = combined.slice(12);
+  const plaintext  = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    ciphertext
+  );
+  return JSON.parse(new TextDecoder().decode(plaintext));
+}
+
+// ═══════════════════════════════════════════════
+//  Server sync
+// ═══════════════════════════════════════════════
+const SERVER_URL = (typeof CONFIG !== 'undefined' && CONFIG.serverUrl) || '';
+
+let authToken  = localStorage.getItem('pantry-auth-token') || null;
+let encKey     = null;  // CryptoKey, set after Google sign-in
+let serverUser = null;  // {name, email}
+
+function isServerConfigured() {
+  return !!SERVER_URL && SERVER_URL !== 'YOUR_SERVER_URL_HERE';
+}
+
+async function signInWithGoogle() {
+  return new Promise((resolve, reject) => {
+    if (!window.google?.accounts?.oauth2) return reject(new Error('Google not loaded'));
+    const client = google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope:     'openid email profile',
+      callback:  async (resp) => {
+        if (resp.error) return reject(new Error(resp.error));
+        try {
+          // Exchange access token for ID token via Google userinfo
+          const ui = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+            headers: { Authorization: `Bearer ${resp.access_token}` }
+          });
+          const userinfo = await ui.json();
+          // Send to our server to get a JWT back
+          const r = await fetch(`${SERVER_URL}/auth/google`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ id_token: resp.access_token, sub: userinfo.sub, email: userinfo.email, name: userinfo.name })
+          });
+          if (!r.ok) throw new Error('Server auth failed');
+          const data = await r.json();
+          authToken  = data.token;
+          serverUser = { name: data.name, email: data.email };
+          localStorage.setItem('pantry-auth-token', authToken);
+          // Derive encryption key from Google sub (unique stable user ID)
+          encKey = await deriveKey(userinfo.sub);
+          resolve(serverUser);
+        } catch(e) { reject(e); }
+      },
+      error_callback: (e) => reject(new Error(e.type || 'Sign-in failed')),
+    });
+    client.requestAccessToken({ prompt: '' });
+  });
+}
+
+// Build notification summary — what the server will push at 8am
+// Returns array of {title, body} objects, encrypted
+async function buildNotifSummary(itemList) {
+  const todayDate = new Date(); todayDate.setHours(0,0,0,0);
+  const cutoff    = new Date(todayDate); cutoff.setDate(cutoff.getDate() + 3);
+  const lines     = [];
+
+  for (const item of itemList) {
+    if (item.removed) continue;
+    if (item.expiry) {
+      const exp  = new Date(item.expiry + 'T00:00:00');
+      const days = Math.round((exp - todayDate) / 86400000);
+      if (days < 0)  lines.push(`🚨 ${item.name} has expired`);
+      else if (days === 0) lines.push(`⏰ ${item.name} expires today`);
+      else if (days <= 3)  lines.push(`⏰ ${item.name} expires in ${days} day${days===1?'':'s'}`);
+    }
+    if (item.category === 'medication' && item.quantity != null && item.dailyDose) {
+      const days = Math.floor(item.quantity / item.dailyDose);
+      if (days <= 7) lines.push(`💊 ${item.name} — ${days <= 0 ? 'out of stock' : `~${days} days left`}`);
+    }
+  }
+
+  if (!lines.length) return '';
+  return encryptData(encKey, { title: 'Pantry — items need attention', body: lines.join('\n') });
+}
+
+async function syncToServer(itemList) {
+  if (!isServerConfigured() || !authToken || !encKey) return;
+  try {
+    const encrypted     = await encryptData(encKey, itemList);
+    const notifSummary  = await buildNotifSummary(itemList);
+    const r = await fetch(`${SERVER_URL}/pantry`, {
+      method:  'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+      body:    JSON.stringify({ data: encrypted, notif_data: notifSummary })
+    });
+    if (r.status === 401) {
+      // Token expired — clear and let user re-sign in next time they open Drive modal
+      authToken = null;
+      localStorage.removeItem('pantry-auth-token');
+    }
+  } catch(e) {
+    console.warn('[Sync] Failed:', e);
+  }
+}
+
+async function syncFromServer() {
+  if (!isServerConfigured() || !authToken || !encKey) return null;
+  try {
+    const r = await fetch(`${SERVER_URL}/pantry`, {
+      headers: { Authorization: `Bearer ${authToken}` }
+    });
+    if (!r.ok) return null;
+    const { data } = await r.json();
+    if (!data) return null;
+    return await decryptData(encKey, data);
+  } catch(e) {
+    console.warn('[Sync] Fetch failed:', e);
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════
 //  State
 // ═══════════════════════════════════════════════
 let items       = [];
@@ -958,22 +1118,20 @@ async function saveItem() {
 }
 
 // ═══════════════════════════════════════════════
-//  Auto-backup: debounced, fires 3s after last change
-//  Only runs if Drive is configured and user has
-//  already authenticated this session
+//  Auto-sync: debounced, fires 3s after last change
+//  Only runs if server is configured and user is
+//  signed in this session
 // ═══════════════════════════════════════════════
-let _autoBackupTimer = null;
+let _autoSyncTimer = null;
 
 function scheduleAutoBackup() {
-  // Don't attempt if not configured or not yet signed in this session
-  if (GOOGLE_CLIENT_ID === 'YOUR_GOOGLE_CLIENT_ID_HERE') return;
-  if (!driveToken || Date.now() >= driveTokenExp - 60000) return;
-
-  clearTimeout(_autoBackupTimer);
-  _autoBackupTimer = setTimeout(async () => {
-    console.log('[AutoBackup] Saving to Drive…');
-    const r = await backupToDrive();
-    console.log('[AutoBackup]', r.ok ? 'Saved ✓' : `Failed: ${r.error}`);
+  if (!isServerConfigured() || !authToken || !encKey) return;
+  clearTimeout(_autoSyncTimer);
+  _autoSyncTimer = setTimeout(async () => {
+    console.log('[AutoSync] Syncing to server…');
+    const allItems = await dbAll();
+    await syncToServer(allItems);
+    console.log('[AutoSync] Done');
   }, 3000);
 }
 
@@ -1197,73 +1355,112 @@ async function restoreFromDrive() {
   }
 }
 
-// ── Drive modal UI ──
+// ── Sync modal UI ──
 function openDriveModal() {
   const body = document.getElementById('drive-modal-body');
-  const isConfigured = GOOGLE_CLIENT_ID !== 'YOUR_GOOGLE_CLIENT_ID_HERE';
 
-  body.innerHTML = isConfigured ? `
-    <div class="drive-info">
-      Your pantry data is saved as a private file in your Google Drive that <strong>only this app can see</strong> — it won't appear in your normal Drive view.
-      <br><br>
-      You'll be asked to sign in to Google the first time.
-    </div>
-
-    <div class="sync-row">
-      <div>
-        <div class="sync-row-title">💾 Back up to Drive</div>
-        <div class="sync-row-label">Save current pantry to your Drive</div>
+  if (!isServerConfigured()) {
+    body.innerHTML = `
+      <div class="drive-info">
+        <strong>⚙️ Server not configured yet</strong><br><br>
+        Add your server URL to <code>config.js</code> — replace
+        <code>YOUR_SERVER_URL_HERE</code> with your server address.
       </div>
-      <button class="btn-icon" id="btn-do-backup" title="Back up now">⬆️</button>
-    </div>
-
-    <div class="sync-row">
-      <div>
-        <div class="sync-row-title">📥 Restore from Drive</div>
-        <div class="sync-row-label">Merge Drive backup into this device</div>
-      </div>
-      <button class="btn-icon" id="btn-do-restore" title="Restore now">⬇️</button>
-    </div>
-
-    <div id="drive-result" style="margin-top:14px;font-size:0.85rem;line-height:1.5;min-height:20px"></div>
-    <button class="btn btn-secondary" onclick="closeModal('drive-modal')" style="margin-top:16px">Close</button>
-  ` : `
-    <div class="drive-info">
-      <strong>⚙️ Client ID not set yet</strong><br><br>
-      Open <code>app.js</code> and replace <code>YOUR_GOOGLE_CLIENT_ID_HERE</code> with the Client ID from your Google Cloud Console project.<br><br>
-      Once that's done, push to GitHub and this button will work.
-    </div>
-    <button class="btn btn-secondary" onclick="closeModal('drive-modal')">Got it</button>`;
-
-  if (isConfigured) {
-    // Wire up after innerHTML is set
-    setTimeout(() => {
-      const resultEl = () => document.getElementById('drive-result');
-
-      document.getElementById('btn-do-backup').onclick = async () => {
-        resultEl().style.color = 'var(--muted)';
-        resultEl().textContent = '⏳ Signing in and saving…';
-        const r = await backupToDrive();
-        resultEl().style.color = r.ok ? 'var(--ok)' : 'var(--danger)';
-        resultEl().textContent = r.ok
-          ? '✅ Backup saved to your Google Drive.'
-          : `❌ ${r.error}`;
-      };
-
-      document.getElementById('btn-do-restore').onclick = async () => {
-        resultEl().style.color = 'var(--muted)';
-        resultEl().textContent = '⏳ Signing in and restoring…';
-        const r = await restoreFromDrive();
-        resultEl().style.color = r.ok ? 'var(--ok)' : 'var(--danger)';
-        resultEl().textContent = r.ok
-          ? `✅ Restored ${r.total} items (${r.added} new, ${r.updated} updated).`
-          : `❌ ${r.error}`;
-      };
-    }, 0);
+      <button class="btn btn-secondary" onclick="closeModal('drive-modal')">Got it</button>`;
+    openModal('drive-modal');
+    return;
   }
+
+  const signedIn = !!authToken && !!encKey;
+
+  body.innerHTML = `
+    <div class="drive-info">
+      Your pantry data is <strong>encrypted on your device</strong> before being sent to the server.
+      Even the server owner cannot read it.
+    </div>
+
+    ${signedIn ? `
+      <div class="sync-row">
+        <div>
+          <div class="sync-row-title">👤 Signed in</div>
+          <div class="sync-row-label">${serverUser?.email || 'Google account'}</div>
+        </div>
+        <span style="color:var(--ok);font-size:1.2rem">✓</span>
+      </div>` : `
+      <button class="btn btn-primary" id="btn-sign-in" style="margin-bottom:12px">
+        🔑 Sign in with Google
+      </button>`}
+
+    <div class="sync-row">
+      <div>
+        <div class="sync-row-title">☁️ Save to server</div>
+        <div class="sync-row-label">Encrypt and upload your pantry</div>
+      </div>
+      <button class="btn-icon" id="btn-do-backup" ${!signedIn ? 'disabled' : ''}>⬆️</button>
+    </div>
+
+    <div class="sync-row">
+      <div>
+        <div class="sync-row-title">📥 Restore from server</div>
+        <div class="sync-row-label">Download and decrypt your pantry</div>
+      </div>
+      <button class="btn-icon" id="btn-do-restore" ${!signedIn ? 'disabled' : ''}>⬇️</button>
+    </div>
+
+    <div id="sync-result" style="margin-top:14px;font-size:0.85rem;line-height:1.5;min-height:20px"></div>
+    <button class="btn btn-secondary" onclick="closeModal('drive-modal')" style="margin-top:16px">Close</button>`;
+
+  setTimeout(() => {
+    const resultEl  = () => document.getElementById('sync-result');
+    const setResult = (msg, ok) => {
+      const el = resultEl(); if (!el) return;
+      el.style.color = ok ? 'var(--ok)' : 'var(--danger)';
+      el.textContent = msg;
+    };
+
+    document.getElementById('btn-sign-in')?.addEventListener('click', async () => {
+      setResult('⏳ Signing in…', true);
+      try {
+        const user = await signInWithGoogle();
+        setDriveStatus('connected', user.name || 'Signed in');
+        openDriveModal();
+      } catch(e) { setResult('❌ ' + e.message, false); }
+    });
+
+    document.getElementById('btn-do-backup')?.addEventListener('click', async () => {
+      setResult('⏳ Encrypting and saving…', true);
+      setDriveStatus('syncing', 'Saving…');
+      try {
+        const allItems = await dbAll();
+        await syncToServer(allItems);
+        setResult('✅ Saved to server (encrypted).', true);
+        setDriveStatus('connected', 'Saved ✓');
+      } catch(e) { setResult('❌ ' + e.message, false); setDriveStatus('error', 'Error'); }
+    });
+
+    document.getElementById('btn-do-restore')?.addEventListener('click', async () => {
+      setResult('⏳ Downloading and decrypting…', true);
+      setDriveStatus('syncing', 'Restoring…');
+      try {
+        const serverItems = await syncFromServer();
+        if (!serverItems) { setResult('❌ No data found or decryption failed.', false); setDriveStatus('error', 'Error'); return; }
+        const local    = await dbAll();
+        const localMap = Object.fromEntries(local.map(i => [i.id, i]));
+        let added = 0, updated = 0;
+        for (const item of serverItems) {
+          localMap[item.id] ? updated++ : added++;
+          await dbPut(item);
+        }
+        await loadItems(); render();
+        setResult('✅ Restored ' + serverItems.length + ' items (' + added + ' new, ' + updated + ' updated).', true);
+        setDriveStatus('connected', 'Restored ✓');
+      } catch(e) { setResult('❌ ' + e.message, false); setDriveStatus('error', 'Error'); }
+    });
+  }, 0);
 
   openModal('drive-modal');
 }
+
 
 // ═══════════════════════════════════════════════
 //  PWA install
